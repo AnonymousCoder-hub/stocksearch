@@ -1,61 +1,90 @@
+# main.py
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
+from rapidfuzz import fuzz, process
 
 app = FastAPI()
 
-# Enable CORS — allows requests from any domain
+# Enable CORS — accessible from anywhere
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allow all HTTP methods
-    allow_headers=["*"],  # Allow all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# Load CSV file once at startup
+# Load CSV once at startup and normalize columns
 try:
     df = pd.read_csv("EQUITY_L.csv")
-    df.columns = df.columns.str.strip().str.upper()  # Normalize column names
+    df.columns = df.columns.str.strip().str.upper()
 except Exception as e:
     raise RuntimeError(f"Error loading EQUITY_L.csv: {e}")
 
+# Attempt to find a suitable name column (common variants)
+NAME_COL = None
+for candidate in ["NAME OF COMPANY", "NAME", "COMPANY NAME", "COMPANY"]:
+    if candidate in df.columns:
+        NAME_COL = candidate
+        break
+
+if "SYMBOL" not in df.columns or NAME_COL is None:
+    raise RuntimeError("EQUITY_L.csv must contain a SYMBOL column and a company name column (e.g. 'NAME OF COMPANY').")
+
+# Prepare combined strings and mapping for fast fuzzy search
+df["SYMBOL_STR"] = df["SYMBOL"].astype(str).str.strip()
+df["NAME_STR"] = df[NAME_COL].astype(str).str.strip()
+df["COMBINED"] = (df["SYMBOL_STR"] + " " + df["NAME_STR"]).str.lower()
+
+# Build choices list and mapping index -> (symbol, name)
+choices = df["COMBINED"].tolist()
+index_to_meta = df[["SYMBOL_STR", "NAME_STR"]].to_dict(orient="index")
+
 @app.get("/search")
-def search_symbols(q: str = Query(..., description="Search query for symbol or company name")):
+def search_symbols(q: str = Query(..., description="Search query for symbol or company name"),
+                   limit: int = Query(15, ge=1, le=100, description="Max number of results to return")):
     """
-    Search for matching stock symbols or company names from EQUITY_L.csv.
-    Prioritizes exact and starts-with matches, then partial matches.
+    Fuzzy search NSE symbols/company names with ranking.
+    Returns best matches (highest similarity first), works for typos.
     """
     try:
         query = q.strip().lower()
+        if not query:
+            raise HTTPException(status_code=400, detail="Query parameter 'q' must be non-empty.")
 
-        if "SYMBOL" not in df.columns or "NAME OF COMPANY" not in df.columns:
-            raise HTTPException(status_code=500, detail="EQUITY_L.csv must have columns: SYMBOL, NAME OF COMPANY")
+        # Use rapidfuzz.process.extract for fast top-N fuzzy matching
+        # returns list of tuples: (choice, score, index)
+        extracted = process.extract(
+            query,
+            choices,
+            scorer=fuzz.token_sort_ratio,
+            limit=limit
+        )
 
-        df["SYMBOL_LOWER"] = df["SYMBOL"].str.lower()
-        df["NAME_LOWER"] = df["NAME OF COMPANY"].str.lower()
+        # Build results mapping back to SYMBOL and NAME
+        results = []
+        for choice_text, score, idx in extracted:
+            meta = index_to_meta.get(idx)
+            if meta:
+                results.append({
+                    "SYMBOL": meta["SYMBOL_STR"],
+                    "NAME": meta["NAME_STR"],
+                    "MATCH_SCORE": round(float(score), 2)
+                })
 
-        # Step 1: Exact matches
-        exact_matches = df[(df["SYMBOL_LOWER"] == query) | (df["NAME_LOWER"] == query)]
-
-        # Step 2: Starts-with matches (only if no exact match)
-        starts_with = df[
-            (df["SYMBOL_LOWER"].str.startswith(query)) | (df["NAME_LOWER"].str.startswith(query))
-        ] if exact_matches.empty else pd.DataFrame()
-
-        # Step 3: Partial matches (only if no exact or starts-with match)
-        partial_matches = df[
-            (df["SYMBOL_LOWER"].str.contains(query)) | (df["NAME_LOWER"].str.contains(query))
-        ] if exact_matches.empty and starts_with.empty else pd.DataFrame()
-
-        combined = pd.concat([exact_matches, starts_with, partial_matches]).drop_duplicates(subset=["SYMBOL"])
-
-        if combined.empty:
+        if not results:
             raise HTTPException(status_code=404, detail=f"No matches found for query: {q}")
 
-        results = combined[["SYMBOL", "NAME OF COMPANY"]].to_dict(orient="records")
+        return {
+            "query": q,
+            "count": len(results),
+            "top_result": results[0],
+            "results": results
+        }
 
-        return {"query": q, "count": len(results), "results": results}
-
+    except HTTPException:
+        raise
     except Exception as e:
+        # return a 500 with readable message
         raise HTTPException(status_code=500, detail=str(e))
